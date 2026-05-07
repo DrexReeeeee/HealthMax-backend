@@ -1,30 +1,13 @@
 const axios = require('axios');
 const supabase = require('../config/supabase');
-const { calculateScore, generateWarnings, getScoreColor } = require('../services/scoringService');
+const { calculateScore, generateWarnings, generateDescription, getScoreColor, normalizeNutrients } = require('../services/scoringService');
 const { getAlternatives } = require('../services/alternativeService');
 const { buildModifiers } = require('../services/personalizationService');
 
-// Open Food Facts base URL
 const OFF_BASE_URL = 'https://world.openfoodfacts.org/api/v0/product';
 
-/**
- * Safely extracts a nutrient value from OFF nutriments object.
- * OFF sometimes uses _100g suffix, sometimes not.
- */
-function getNutrient(nutriments, ...keys) {
-  for (const key of keys) {
-    const val = nutriments[`${key}_100g`] ?? nutriments[key];
-    if (val !== undefined && val !== null && !isNaN(val)) {
-      return parseFloat(val);
-    }
-  }
-  return 0;
-}
+// ─── OFF fetch ────────────────────────────────────────────────────────────────
 
-/**
- * Fetches product from Open Food Facts API.
- * Returns normalized product object or null if not found.
- */
 async function fetchFromOFF(barcode) {
   try {
     const url = `${OFF_BASE_URL}/${barcode}.json`;
@@ -32,71 +15,110 @@ async function fetchFromOFF(barcode) {
 
     const response = await axios.get(url, {
       timeout: 10000,
-      headers: {
-        'User-Agent': 'FitMax/1.0 (fitmax@gmail.com)', // OFF requires a User-Agent
-      },
+      headers: { 'User-Agent': 'FitMax/1.0 (fitmax@gmail.com)' },
     });
 
     const data = response.data;
-
-    // OFF returns status 0 if product not found
     if (!data || data.status === 0 || !data.product) {
-      console.log(`[OFF] Product not found for barcode: ${barcode}`);
+      console.log(`[OFF] Product not found: ${barcode}`);
       return null;
     }
 
     const p = data.product;
     const n = p.nutriments || {};
 
-    // Extract nutrients safely
-    const sugar = getNutrient(n, 'sugars');
-    const salt = getNutrient(n, 'salt');
-    const saturated_fat = getNutrient(n, 'saturated-fat', 'saturated_fat');
-    const fiber = getNutrient(n, 'fiber');
-    const calories = getNutrient(n, 'energy-kcal', 'energy_kcal', 'energy');
+    // ── FIX: capture ALL key variants OFF uses ────────────────────────
+    // OFF is inconsistent — some products store values under `sugars_100g`,
+    // others under plain `sugars`. We capture every variant here so
+    // normalizeNutrients() never silently falls back to 0 when the data
+    // actually exists under a different key name.
+    const rawNutrients = {
+      // Energy: prefer kcal key, keep kJ as fallback (normalizeNutrients divides by 4.184)
+      energy_kcal_100g:
+        n['energy-kcal_100g'] ??
+        n['energy-kcal']      ??
+        null,
+      energy_100g:
+        n['energy_100g'] ??
+        n['energy']      ??
+        null,
 
-    // Extract category — OFF returns array like ["en:beverages", "en:juices"]
-    let category = 'General';
-    if (p.categories_tags && p.categories_tags.length > 0) {
-      // Try to find an English category
-      const englishCat = p.categories_tags.find(c => c.startsWith('en:'));
-      if (englishCat) {
-        category = englishCat
-          .replace('en:', '')
-          .split('-')
-          .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-          .join(' ');
-      }
+      // Sugar — OFF uses both 'sugars_100g' and plain 'sugars'
+      sugars_100g:
+        n['sugars_100g'] ??
+        n['sugars']      ??
+        null,
+
+      // Saturated fat — note the hyphen in the OFF key name
+      'saturated-fat_100g':
+        n['saturated-fat_100g'] ??
+        n['saturated-fat']      ??
+        null,
+
+      // Salt
+      salt_100g:
+        n['salt_100g'] ??
+        n['salt']      ??
+        null,
+
+      // Sodium — OFF gives this in grams; normalizeNutrients converts to mg
+      sodium_100g:
+        n['sodium_100g'] ??
+        n['sodium']      ??
+        null,
+
+      // Fiber — OFF uses both 'fiber' and 'fibers' variants
+      fiber_100g:
+        n['fiber_100g']  ??
+        n['fiber']       ??
+        n['fibers_100g'] ??
+        n['fibers']      ??
+        null,
+
+      // Proteins
+      proteins_100g:
+        n['proteins_100g'] ??
+        n['proteins']      ??
+        n['protein_100g']  ??
+        n['protein']       ??
+        null,
+
+      nova_group:     p.nova_group     ?? null,
+      additives_tags: p.additives_tags ?? [],
+    };
+
+    // Log resolved nutriments so future products are easy to debug
+    console.log(`[OFF] Raw nutriments for ${barcode}:`, JSON.stringify(rawNutrients));
+
+    // Category: last English tag = most specific
+    let category = 'general';
+    if (p.categories_tags?.length) {
+      const enTags = p.categories_tags.filter(c => c.startsWith('en:'));
+      if (enTags.length) category = enTags[enTags.length - 1];
     }
 
     return {
       barcode,
-      name: p.product_name_en || p.product_name || 'Unknown Product',
-      brand: p.brands || 'Unknown Brand',
+      name:       p.product_name_en || p.product_name || 'Unknown Product',
+      brand:      p.brands || 'Unknown Brand',
       category,
-      image_url: p.image_front_url || p.image_url || null,
-      sugar,
-      salt,
-      saturated_fat,
-      fiber,
-      calories,
+      image_url:  p.image_front_url || p.image_url || null,
+      nutriscore: p.nutriscore_grade?.toUpperCase() ?? null,
+      rawNutrients,
     };
   } catch (err) {
-    if (err.code === 'ECONNABORTED') {
-      console.error('[OFF] Request timed out');
-    } else {
-      console.error('[OFF] Error:', err.message);
-    }
+    console.error('[OFF] Error:', err.code === 'ECONNABORTED' ? 'Timeout' : err.message);
     return null;
   }
 }
+
+// ─── Controller ───────────────────────────────────────────────────────────────
 
 async function getProduct(req, res) {
   try {
     const { barcode } = req.params;
     const userId = req.user?.id;
 
-    // Validate barcode format (digits only, 8–14 chars)
     if (!/^\d{8,14}$/.test(barcode)) {
       return res.status(400).json({
         success: false,
@@ -104,20 +126,22 @@ async function getProduct(req, res) {
       });
     }
 
-    // ── STEP 1: Check Supabase product cache ──────────────────────────
-    let { data: cachedProduct } = await supabase
+    // ── STEP 1: Check Supabase cache ──────────────────────────────────
+    let { data: cached } = await supabase
       .from('products')
       .select('*')
       .eq('barcode', barcode)
       .single();
 
-    let product = cachedProduct;
+    let offProduct = null;
+    let rawNutrients = {};
 
-    // ── STEP 2: If not cached, fetch from Open Food Facts ─────────────
-    if (!product) {
-      console.log(`[Cache MISS] Barcode ${barcode} — calling Open Food Facts`);
-
-      const offProduct = await fetchFromOFF(barcode);
+    if (cached) {
+      console.log(`[Cache HIT] ${barcode}`);
+      rawNutrients = cached.nutrients ?? {};
+    } else {
+      console.log(`[Cache MISS] ${barcode} — calling Open Food Facts`);
+      offProduct = await fetchFromOFF(barcode);
 
       if (!offProduct) {
         return res.status(404).json({
@@ -126,82 +150,110 @@ async function getProduct(req, res) {
         });
       }
 
-      // Calculate base score (no personalization yet)
-      const base_score = calculateScore({
-        sugar: offProduct.sugar,
-        salt: offProduct.salt,
-        saturated_fat: offProduct.saturated_fat,
-        fiber: offProduct.fiber,
-      });
-
-      const newProduct = { ...offProduct, base_score };
-
-      // Cache in Supabase so we don't call OFF again
-      const { error: insertError } = await supabase
-        .from('products')
-        .upsert(newProduct, { onConflict: 'barcode' });
-
-      if (insertError) {
-        console.error('[Cache] Failed to cache product:', insertError.message);
-      } else {
-        console.log(`[Cache SET] Barcode ${barcode} cached successfully`);
-      }
-
-      product = newProduct;
-    } else {
-      console.log(`[Cache HIT] Barcode ${barcode} served from cache`);
+      rawNutrients = offProduct.rawNutrients;
     }
 
-    // ── STEP 3: Get user personalization modifiers (if signed in) ──────
+    // ── STEP 3: User personalization ──────────────────────────────────
     let modifiers = {};
+    let userContext = {};
+
     if (userId) {
       const { data: profile } = await supabase
-        .from('user_profiles')
-        .select('sugar_modifier, salt_modifier, fat_modifier')
+        .from('UserProfiles')
+        .select('sugar_modifier, salt_modifier, fat_modifier, health_goal, dietary_preference')
         .eq('user_id', userId)
         .single();
 
       if (profile) {
         modifiers = buildModifiers(profile);
-        console.log(`[Personalization] Modifiers for user ${userId}:`, modifiers);
+        userContext = {
+          health_goal:        profile.health_goal,
+          dietary_preference: profile.dietary_preference,
+        };
+        console.log(`[Personalization] user=${userId} goal=${userContext.health_goal}`);
       }
     }
 
-    // ── STEP 4: Calculate personalized score & warnings ────────────────
-    const nutrients = {
-      sugar: product.sugar,
-      salt: product.salt,
-      saturated_fat: product.saturated_fat,
-      fiber: product.fiber,
-    };
+    // ── STEP 4: Score ─────────────────────────────────────────────────
+    const { score, grade, breakdown } = calculateScore(rawNutrients, modifiers, userContext);
+    const { warnings, tips }          = generateWarnings(rawNutrients, modifiers, userContext);
+    const description                  = generateDescription(score, breakdown, userContext);
+    const color                        = getScoreColor(score);
 
-    const finalScore = calculateScore(nutrients, modifiers);
-    const warnings = generateWarnings(nutrients, modifiers);
-    const scoreColor = getScoreColor(finalScore);
+    // Normalize BEFORE the upsert so norm is available for dedicated columns
+    const norm = normalizeNutrients(rawNutrients);
 
-    // ── STEP 5: Get alternatives (same category, higher base score) ────
-    const alternatives = await getAlternatives(product.category, product.base_score, barcode);
+    const productData = cached ?? offProduct;
+    const category    = productData.category ?? 'general';
 
-    // ── STEP 6: Build & return response ───────────────────────────────
+    // ── STEP 5: Cache new products ────────────────────────────────────
+    if (!cached && offProduct) {
+      const { error: insertError } = await supabase
+        .from('products')
+        .upsert({
+          barcode:       offProduct.barcode,
+          name:          offProduct.name,
+          brand:         offProduct.brand,
+          category,
+          image_url:     offProduct.image_url,
+          nutrients:     rawNutrients,
+          calories:      norm.energy_kcal      ?? null,
+          sugar:         norm.sugar            ?? null,
+          saturated_fat: norm.saturated_fat    ?? null,
+          fiber:         norm.fiber            ?? null,
+          salt:          rawNutrients.salt_100g ?? (norm.sodium != null ? +(norm.sodium / 1000 * 2.5).toFixed(4) : null),
+          base_score:    score,
+          updated_at:    new Date().toISOString(),
+        }, { onConflict: 'barcode' });
+
+      if (insertError) {
+        console.error('[Cache] Insert failed:', insertError.message);
+      } else {
+        console.log(`[Cache SET] ${barcode}`);
+      }
+    }
+
+    // ── STEP 6: Alternatives ──────────────────────────────────────────
+    const alternatives = await getAlternatives({
+      category,
+      currentScore:     score,
+      currentBarcode:   barcode,
+      currentNutrients: rawNutrients,
+      modifiers,
+      userContext,
+    });
+
+    // ── STEP 7: Respond ───────────────────────────────────────────────
     return res.json({
       success: true,
-      source: cachedProduct ? 'cache' : 'open_food_facts',
+      source: cached ? 'cache' : 'open_food_facts',
       product: {
-        barcode: product.barcode,
-        name: product.name,
-        brand: product.brand,
-        category: product.category,
-        image_url: product.image_url,
+        barcode,
+        name:       productData.name,
+        brand:      productData.brand,
+        category,
+        image_url:  productData.image_url,
+        nutriscore: productData.nutriscore ?? null,
         nutrients: {
-          sugar: product.sugar,
-          salt: product.salt,
-          saturated_fat: product.saturated_fat,
-          fiber: product.fiber,
-          calories: product.calories,
+          sugar_g:          norm.sugar,
+          saturated_fat_g:  norm.saturated_fat,
+          sodium_mg:        norm.sodium,
+          energy_kcal:      norm.energy_kcal,
+          fiber_g:          norm.fiber,
+          protein_g:        norm.protein,
+          nova_group:       norm.nova_group,
+          additives_count:  norm.additives_count,
         },
-        score: finalScore,
-        score_color: scoreColor,
+        evaluation: {
+          score,
+          grade,
+          color,
+          display:  `${score}/100`,
+          breakdown,
+        },
+        description,
         warnings,
+        tips,
         alternatives,
       },
     });
