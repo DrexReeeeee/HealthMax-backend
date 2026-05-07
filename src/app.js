@@ -14,6 +14,8 @@ app.use('/api/history', require('./routes/historyRoutes'));
 app.use('/api/gamification', require('./routes/gamificationRoutes'));
 app.use('/api/dashboard', require('./routes/dashboardRoutes'));
 app.use('/api/profile', require('./routes/profileRoutes'));
+const leaderboardRoutes = require('./routes/leaderboardRoutes');
+app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api/sync', require('./routes/syncRoutes'));
 
 // Health check
