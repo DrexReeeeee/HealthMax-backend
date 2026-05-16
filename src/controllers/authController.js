@@ -77,7 +77,7 @@ async function register(req, res) {
       .from('user_profiles')
       .select('username')
       .eq('username', username)
-      .single();
+      .maybeSingle();
 
     if (existingUsername) {
       return res.status(400).json({
